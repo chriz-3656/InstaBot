@@ -28,7 +28,7 @@ class Logger {
 
 	constructor() {
 		// Initialize with default path; will be updated in initialize()
-		this.logsDir = path.join(os.homedir(), '.instagram-cli', 'logs');
+		this.logsDir = path.join(os.homedir(), '.instagram-discord-bot', 'logs');
 		this.sessionId = this.generateSessionId();
 		this.logFilePath = path.join(this.logsDir, `session-${this.sessionId}.log`);
 	}

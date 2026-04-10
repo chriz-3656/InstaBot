@@ -47,7 +47,7 @@ type Config = {
 	advanced: AdvancedConfig;
 };
 
-const DEFAULT_DATA_DIR = path.join(os.homedir(), '.instagram-cli');
+const DEFAULT_DATA_DIR = path.join(os.homedir(), '.instagram-discord-bot');
 
 const DEFAULT_CONFIG: Config = {
 	language: 'en',
