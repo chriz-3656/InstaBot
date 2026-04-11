@@ -9,10 +9,13 @@ import {
 	SlashCommandBuilder,
 	TextInputBuilder,
 	TextInputStyle,
+	ContainerBuilder,
+	TextDisplayBuilder,
 	type ButtonInteraction,
 	type ChatInputCommandInteraction,
 	type ModalSubmitInteraction,
 	type StringSelectMenuInteraction,
+	type APIMessageComponent,
 } from 'discord.js';
 import {type DmRelay} from '../../bridge/dm-relay.js';
 import {type NotificationPoller} from '../../bridge/notification-poller.js';
@@ -493,10 +496,30 @@ const executeReply = async (
 // --- Panel rendering ---
 
 const renderPanel = (): {
-	embeds: EmbedBuilder[];
-	components: Array<ActionRowBuilder<ButtonBuilder>>;
+	content?: string;
+	components: APIMessageComponent[];
 } => {
-	const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+	// Messaging buttons row
+	const messagingRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+		new ButtonBuilder()
+			.setCustomId('ig:btn:send')
+			.setLabel('Send')
+			.setStyle(ButtonStyle.Success)
+			.setEmoji('\u{2709}\u{FE0F}'),
+		new ButtonBuilder()
+			.setCustomId('ig:btn:reply')
+			.setLabel('Reply')
+			.setStyle(ButtonStyle.Secondary)
+			.setEmoji('\u{21A9}\u{FE0F}'),
+		new ButtonBuilder()
+			.setCustomId('ig:btn:unsend')
+			.setLabel('Unsend')
+			.setStyle(ButtonStyle.Danger)
+			.setEmoji('\u{1F5D1}\u{FE0F}'),
+	);
+
+	// Inbox buttons row
+	const inboxRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
 		new ButtonBuilder()
 			.setCustomId('ig:btn:inbox')
 			.setLabel('Inbox')
@@ -508,36 +531,72 @@ const renderPanel = (): {
 			.setStyle(ButtonStyle.Secondary)
 			.setEmoji('\u{1F50D}'),
 		new ButtonBuilder()
-			.setCustomId('ig:btn:send')
-			.setLabel('Send')
-			.setStyle(ButtonStyle.Success)
-			.setEmoji('\u{2709}\u{FE0F}'),
-		new ButtonBuilder()
-			.setCustomId('ig:btn:reply')
-			.setLabel('Reply')
+			.setCustomId('ig:btn:unread')
+			.setLabel('Unread')
 			.setStyle(ButtonStyle.Secondary)
-			.setEmoji('\u{21A9}\u{FE0F}'),
+			.setEmoji('\u{1F514}'),
 	);
 
-	const embed = new EmbedBuilder()
-		.setColor(EMBED_COLOR)
-		.setTitle('Instagram DM Manager')
-		.setDescription(
-			'Manage your Instagram direct messages from Discord.\n\n' +
-				'\u{1F4E5} **Inbox** - View recent DM threads\n' +
-				'\u{1F50D} **Search** - Find threads by username or title\n' +
-				'\u{2709}\u{FE0F} **Send** - Send a message to a thread\n' +
-				'\u{21A9}\u{FE0F} **Reply** - Reply to a specific message\n\n' +
-				'Use the buttons below to get started.',
+	// Tools buttons row
+	const toolsRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+		new ButtonBuilder()
+			.setCustomId('ig:btn:profile')
+			.setLabel('Profile')
+			.setStyle(ButtonStyle.Secondary)
+			.setEmoji('\u{1F464}'),
+		new ButtonBuilder()
+			.setCustomId('ig:btn:notif-followers')
+			.setLabel('Followers')
+			.setStyle(ButtonStyle.Secondary)
+			.setEmoji('\u{1F465}'),
+		new ButtonBuilder()
+			.setCustomId('ig:btn:notif-mentions')
+			.setLabel('Mentions')
+			.setStyle(ButtonStyle.Secondary)
+			.setEmoji('\u{1F4DB}'),
+	);
+
+	// Container with V2 components
+	const container = new ContainerBuilder()
+		.addTextDisplayComponents(
+			new TextDisplayBuilder().setContent(
+				'# \u{1F4F1} Instagram DM Manager\n' +
+					'Manage your Instagram direct messages from Discord.',
+			),
 		)
-		.setFooter({
-			text: 'Unofficial Instagram integration - use at your own risk',
-		})
-		.setTimestamp();
+		.addSeparatorComponents()
+		.addTextDisplayComponents(
+			new TextDisplayBuilder().setContent(
+				'## \u{2709}\u{FE0F} Messaging\n' +
+					'**Send** - Message a thread | **Reply** - Reply to a message | **Unsend** - Delete a message',
+			),
+		)
+		.addActionRowComponents(messagingRow)
+		.addSeparatorComponents()
+		.addTextDisplayComponents(
+			new TextDisplayBuilder().setContent(
+				'## \u{1F4E5} Inbox\n' +
+					'**Inbox** - View threads | **Search** - Find threads | **Unread** - Check unread chats',
+			),
+		)
+		.addActionRowComponents(inboxRow)
+		.addSeparatorComponents()
+		.addTextDisplayComponents(
+			new TextDisplayBuilder().setContent(
+				'## \u{1F6E0}\u{FE0F} Tools & Notifications\n' +
+					'**Profile** - Lookup user | **Followers** - Toggle alerts | **Mentions** - Toggle alerts',
+			),
+		)
+		.addActionRowComponents(toolsRow)
+		.addSeparatorComponents()
+		.addTextDisplayComponents(
+			new TextDisplayBuilder().setContent(
+				'> \u{26A0}\u{FE0F} Unofficial Instagram integration — use at your own risk',
+			),
+		);
 
 	return {
-		embeds: [embed],
-		components: [row],
+		components: [container.toJSON()],
 	};
 };
 
@@ -564,6 +623,47 @@ const buildSearchModal = (): ModalBuilder => {
 		.addComponents(
 			new ActionRowBuilder<TextInputBuilder>().addComponents(queryInput),
 			new ActionRowBuilder<TextInputBuilder>().addComponents(limitInput),
+		);
+};
+
+const buildUnsendModal = (): ModalBuilder => {
+	const threadInput = new TextInputBuilder()
+		.setCustomId('thread')
+		.setLabel('Thread ID / username / title')
+		.setRequired(true)
+		.setStyle(TextInputStyle.Short)
+		.setPlaceholder('e.g. john_doe or 1234567890');
+
+	const messageIdInput = new TextInputBuilder()
+		.setCustomId('message_id')
+		.setLabel('Message ID to delete')
+		.setRequired(true)
+		.setStyle(TextInputStyle.Short)
+		.setPlaceholder('Paste the message ID');
+
+	return new ModalBuilder()
+		.setCustomId('ig:modal:unsend')
+		.setTitle('IG Unsend')
+		.addComponents(
+			new ActionRowBuilder<TextInputBuilder>().addComponents(threadInput),
+			new ActionRowBuilder<TextInputBuilder>().addComponents(messageIdInput),
+		);
+};
+
+const buildProfileModal = (): ModalBuilder => {
+	const usernameInput = new TextInputBuilder()
+		.setCustomId('username')
+		.setLabel('Instagram username')
+		.setRequired(true)
+		.setStyle(TextInputStyle.Short)
+		.setMaxLength(80)
+		.setPlaceholder('Enter username to lookup');
+
+	return new ModalBuilder()
+		.setCustomId('ig:modal:profile')
+		.setTitle('IG Profile Lookup')
+		.addComponents(
+			new ActionRowBuilder<TextInputBuilder>().addComponents(usernameInput),
 		);
 };
 
@@ -808,7 +908,11 @@ export async function handleIgCommand(
 	}
 
 	if (subcommand === 'panel') {
-		await interaction.editReply(renderPanel());
+		const panel = renderPanel();
+		await interaction.editReply({
+			content: panel.content,
+			components: panel.components,
+		});
 		return;
 	}
 
@@ -1030,6 +1134,86 @@ export async function handleIgButton(
 		return true;
 	}
 
+	if (action === 'unsend') {
+		await interaction.showModal(buildUnsendModal());
+		return true;
+	}
+
+	if (action === 'unread') {
+		await interaction.deferReply({ephemeral: true});
+		const {account, client} = await resolveClient(context);
+		const {threads} = await client.getThreads();
+
+		const unreadThreads = threads
+			.filter(t => t.unread)
+			.slice(0, 20)
+			.map(t => {
+				const lastMsg =
+					t.lastMessage && 'text' in t.lastMessage
+						? t.lastMessage.text
+						: t.lastMessage
+							? '[non-text message]'
+							: 'No messages yet';
+				return {
+					title: t.title,
+					lastMessage: lastMsg,
+					lastActivity: t.lastActivity,
+					id: t.id,
+				};
+			});
+
+		await interaction.editReply({
+			embeds: [buildUnreadEmbed(unreadThreads, threads.length, account)],
+		});
+		return true;
+	}
+
+	if (action === 'profile') {
+		await interaction.showModal(buildProfileModal());
+		return true;
+	}
+
+	// Notification toggle buttons
+	if (action === 'notif-followers') {
+		await interaction.deferReply({ephemeral: true});
+		const {account} = await resolveClient(context);
+		const enabled = context.notificationPoller.toggleSetting(
+			account,
+			'followers',
+		);
+		const status = enabled ? 'enabled' : 'disabled';
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Follower Alerts',
+					`\u{1F465} Follower notifications are now **${status}**.`,
+					account,
+				),
+			],
+		});
+		return true;
+	}
+
+	if (action === 'notif-mentions') {
+		await interaction.deferReply({ephemeral: true});
+		const {account} = await resolveClient(context);
+		const enabled = context.notificationPoller.toggleSetting(
+			account,
+			'mentions',
+		);
+		const status = enabled ? 'enabled' : 'disabled';
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Mention Alerts',
+					`\u{1F4DB} Mention notifications are now **${status}**.`,
+					account,
+				),
+			],
+		});
+		return true;
+	}
+
 	return false;
 }
 
@@ -1156,6 +1340,47 @@ export async function handleIgModal(
 					account,
 				),
 			],
+		});
+		return true;
+	}
+
+	if (action === 'unsend') {
+		const threadQuery = interaction.fields.getTextInputValue('thread').trim();
+		const messageId = interaction.fields.getTextInputValue('message_id').trim();
+		const {threadId} = await resolveThread(client, threadQuery);
+
+		await context.queue.enqueue(`unsend:${account}:${threadId}`, async () => {
+			await context.rateLimiter.take(`unsend:${account}`);
+			return withRetry(async () => client.unsendMessage(threadId, messageId));
+		});
+
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Message Deleted',
+					`Message \`${messageId}\` has been deleted from thread \`${threadId}\`.`,
+					account,
+				),
+			],
+		});
+		return true;
+	}
+
+	if (action === 'profile') {
+		const username = interaction.fields.getTextInputValue('username').trim();
+		const profile = await withRetry(async () =>
+			client.getUserProfile(username),
+		);
+
+		if (!profile) {
+			await interaction.editReply({
+				embeds: [buildErrorEmbed(`User @${username} not found.`)],
+			});
+			return true;
+		}
+
+		await interaction.editReply({
+			embeds: [buildProfileEmbed(profile, account)],
 		});
 		return true;
 	}
