@@ -1,0 +1,7 @@
+dist
+node_modules
+build
+*.lock
+instagram-py/
+.yalc/
+.tsimp/

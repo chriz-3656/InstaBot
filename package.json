@@ -1,0 +1,90 @@
+{
+	"name": "instagram-discord-bot",
+	"description": "Discord-based Instagram automation bot with realtime DM relay",
+	"version": "1.5.0",
+	"license": "MIT",
+	"keywords": [
+		"instagram",
+		"discord",
+		"bot",
+		"typescript",
+		"instagram-api",
+		"automation",
+		"messenger"
+	],
+	"bin": {
+		"instagram-discord-bot": "dist/bot.js"
+	},
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"format": "prettier --write .",
+		"build": "tsc --noEmit && node esbuild.config.mjs --production",
+		"clean": "rm -rf dist",
+		"lint-check": "prettier --check . && xo --ignore esbuild.config.mjs",
+		"prepare": "husky",
+		"dev": "node esbuild.config.mjs --watch",
+		"dev:watch": "node esbuild.config.mjs --watch",
+		"start": "node dist/bot.js",
+		"auth:login": "node --loader ts-node/esm source/auth-login.ts",
+		"test": "prettier --check . && xo --ignore esbuild.config.mjs && ava",
+		"postinstall": "patch-package"
+	},
+	"files": [
+		"dist",
+		"patches"
+	],
+	"dependencies": {
+		"debug": "^4.4.3",
+		"discord.js": "^14.20.0",
+		"dotenv": "^16.6.1",
+		"file-type": "^21.0.0",
+		"fuse.js": "^7.1.0",
+		"instagram_mqtt": "^1.2.3",
+		"instagram-private-api": "^1.46.1",
+		"js-yaml": "^4.1.0",
+		"patch-package": "^8.0.1",
+		"sharp": "^0.34.4",
+		"zod": "^4.1.0"
+	},
+	"devDependencies": {
+		"@sindresorhus/tsconfig": "^8.1.0",
+		"@types/debug": "^4.1.12",
+		"@types/node": "^24.8.1",
+		"@types/js-yaml": "^4.0.9",
+		"@vdemedes/prettier-config": "^2.0.1",
+		"ava": "^7.0.0",
+		"chalk": "^5.2.0",
+		"esbuild": "^0.27.2",
+		"husky": "^9.1.7",
+		"lint-staged": "^16.2.7",
+		"prettier": "^3.3.3",
+		"ts-node": "^10.9.2",
+		"typescript": "^5.0.3",
+		"xo": "^2.0.1"
+	},
+	"ava": {
+		"files": [
+			"tests/**"
+		],
+		"extensions": {
+			"ts": "module",
+			"tsx": "module"
+		},
+		"nodeArguments": [
+			"--loader=ts-node/esm"
+		]
+	},
+	"prettier": "@vdemedes/prettier-config",
+	"lint-staged": {
+		"**/*.{ts,js,json,md}": "prettier --write",
+		"**/*.ts": "xo --ignore esbuild.config.mjs"
+	},
+	"overrides": {
+		"form-data": "^4.0.0",
+		"qs": "^6.14.1",
+		"tough-cookie": "^5.1.0"
+	}
+}
