@@ -14,3 +14,12 @@ coverage
 *.DS_Store
 .worktrees/
 .codex
+
+# Runtime data (stored in home directory by default)
+# ~/.instagram-discord-bot/
+
+# Local project data (created at runtime)
+data/
+
+# OS files
+Thumbs.db
