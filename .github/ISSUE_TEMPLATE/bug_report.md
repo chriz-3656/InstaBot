@@ -26,13 +26,12 @@ If applicable, add screenshots to help explain your problem.
 **System Information:**
 
 - OS: [e.g. Ubuntu 22.04]
-- Terminal: [e.g. Kitty 0.26.5]
-- Client: [TypeScript or Python]
-- Instagram CLI Version: (for TypeScript client, paste in the entire output of `instagram-cli version`)
+- Node.js Version: [e.g. 20.10.0]
+- Bot Version: [e.g. 1.5.0]
 
 **Logs (optional)**
 
-Paste in the logs from `.instagram-cli/logs` here. You may want to redact sensitive data like your username for privacy.
+Paste in the logs from `~/.instagram-discord-bot/logs/` here. You may want to redact sensitive data like your username for privacy.
 
 **Additional context**
 Add any other context about the problem here.
