@@ -22,7 +22,7 @@ Use temporary/demo accounts only. Do **not** use your main account. You use this
 
 ### Inbox & Search
 
-- **Inbox** - View recent DM threads with unread indicators
+- **Inbox** - View recent DM threads with unread indicators and select menu navigation
 - **Search** - Find threads by username or title with match scoring
 - **Unread check** - See all unread conversations at a glance
 
@@ -46,17 +46,18 @@ Use temporary/demo accounts only. Do **not** use your main account. You use this
 ### Interactive UI
 
 - Rich embed responses with color-coded messages (success, error, info)
-- Select menus for inbox/search thread navigation
+- Select menus for inbox/search thread navigation with smart label truncation
 - Modal forms for send, reply, and search (no long slash command typing)
 - Button-based panel for quick access
 
-### Safety
+### Safety & Reliability
 
 - Token bucket rate limiting
 - Async queue for operation serialization
 - Exponential backoff retry logic
 - Interaction expiry handling (prevents "Interaction failed" errors)
-- Discord API limit compliance (100-byte customIds, 100-char labels, etc.)
+- Discord API limit compliance (100-byte customIds, 100-char labels, smart text truncation)
+- Component validation to prevent malformed Discord API requests
 
 ## Tech Stack
 
@@ -282,6 +283,22 @@ Check logs in:
 | `npm run dev`        | Watch mode development                 |
 | `npm test`           | Prettier + xo + ava                    |
 | `npm run format`     | Format files                           |
+
+## Recent Improvements (v1.5.0+)
+
+### Discord Component & API Fixes
+
+- Fixed Discord component serialization errors (`Invalid Form Body` errors)
+- Added explicit `setMinValues(1)` and `setMaxValues(1)` to select menus (required by Discord API)
+- Refactored text truncation to handle character limits correctly instead of byte limits
+- Implemented smart label fallbacks to prevent empty select menu options
+- Added separate byte-based truncation for embed field values to preserve longer descriptions
+
+### Text Truncation Enhancements
+
+- Character-based truncation for Discord labels and descriptions (max 100 chars)
+- Byte-based truncation for embed fields and long descriptions (max 1024 bytes)
+- Fallback text `[No title]` and `[truncated]` to ensure valid Discord components
 
 ## Project Structure
 
