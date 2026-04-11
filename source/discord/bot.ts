@@ -51,7 +51,7 @@ export async function startDiscordBot(): Promise<{
 		intents: [GatewayIntentBits.Guilds],
 	});
 
-	const {accountManager} = installCommandRouter(client);
+	const {accountManager, notificationPoller} = installCommandRouter(client);
 
 	client.once('ready', () => {
 		logger.info(`Discord bot connected as ${client.user?.tag ?? 'unknown'}`);
@@ -62,6 +62,7 @@ export async function startDiscordBot(): Promise<{
 
 	return {
 		async shutdown() {
+			notificationPoller.stop();
 			await accountManager.shutdown();
 			await client.destroy();
 		},

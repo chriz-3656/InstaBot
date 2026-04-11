@@ -79,6 +79,7 @@ function extractItemId(result: BroadcastResponse): string {
 // eslint-disable-next-line unicorn/prefer-event-target
 export class InstagramClient extends EventEmitter {
 	public static async cleanupSessions(): Promise<void> {
+		const logger = createContextualLogger('cleanupSessions');
 		try {
 			const configManager = ConfigManager.getInstance();
 			await configManager.initialize();
@@ -96,17 +97,25 @@ export class InstagramClient extends EventEmitter {
 					);
 					try {
 						fs.unlinkSync(sessionFile);
-					} catch {}
+					} catch (error) {
+						logger.warn(
+							`Failed to delete session file for ${userSubdirectory}: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
 				}
-			} catch {}
+			} catch (error) {
+				logger.warn(
+					`Failed to read users directory: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		} catch (error) {
-			const logger = createContextualLogger('cleanupSessions');
 			logger.error('Error during session cleanup', error);
 			throw error;
 		}
 	}
 
 	public static async cleanupCache(): Promise<void> {
+		const logger = createContextualLogger('cleanupCache');
 		try {
 			const configManager = ConfigManager.getInstance();
 			await configManager.initialize();
@@ -125,16 +134,20 @@ export class InstagramClient extends EventEmitter {
 					for (const file of files) {
 						fs.unlinkSync(join(directory, file));
 					}
-				} catch {}
+				} catch (error) {
+					logger.warn(
+						`Failed to clean directory: ${directory}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
 			}
 		} catch (error) {
-			const logger = createContextualLogger('cleanupCache');
 			logger.error('Error during cache cleanup', error);
 			throw error;
 		}
 	}
 
 	public static async cleanupLogs(): Promise<void> {
+		const logger = createContextualLogger('cleanupLogs');
 		try {
 			const configManager = ConfigManager.getInstance();
 			await configManager.initialize();
@@ -145,9 +158,12 @@ export class InstagramClient extends EventEmitter {
 				for (const file of files) {
 					fs.unlinkSync(join(logsDirectory, file));
 				}
-			} catch {}
+			} catch (error) {
+				logger.warn(
+					`Failed to clean logs directory: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		} catch (error) {
-			const logger = createContextualLogger('cleanupLogs');
 			logger.error('Error during logs cleanup', error);
 			throw error;
 		}
@@ -710,20 +726,28 @@ export class InstagramClient extends EventEmitter {
 		try {
 			// Use cached threads if available and not expired
 			const now = Date.now();
-			let isCacheExpired =
+			const isCacheExpired =
 				this.threadsCache.length === 0 ||
 				!this.threadsCacheTimestamp ||
 				now - this.threadsCacheTimestamp > this.threadsCacheTTL;
+
 			if (isCacheExpired) {
-				this.threadsCache.length = 0;
+				// Clear stale cache so we do a fresh load
+				this.threadsCache = [];
+				this.threadsCacheTimestamp = undefined;
+				this.inboxFeed = undefined;
 			}
 
+			// Fetch threads until we have enough or no more available
+			// First fetch after cache expiry is always a fresh load (loadMore = false)
+			// Subsequent fetches are pagination (loadMore = true)
 			let hasMore = true;
+			let isFirstFetch = true;
 			while (this.threadsCache.length < maxThreadsToSearch && hasMore) {
 				// eslint-disable-next-line no-await-in-loop
-				const result = await this.getThreads(!isCacheExpired);
+				const result = await this.getThreads(!isFirstFetch);
 				hasMore = result.hasMore;
-				isCacheExpired = false; // After first fetch, subsequent fetches are loadMore
+				isFirstFetch = false;
 				if (!hasMore) {
 					this.logger.debug('No more threads available to fetch');
 					break;
@@ -793,9 +817,18 @@ export class InstagramClient extends EventEmitter {
 		if (this.realtimeStatus === 'connected' && this.realtime?.direct) {
 			try {
 				await this.realtime.direct.markAsSeen({threadId, itemId});
+				return;
 			} catch {
 				this.logger.warn('MQTT mark as seen failed, falling back to API.');
 			}
+		}
+
+		// Fallback to API if MQTT not available or failed
+		try {
+			await this.ig.entity.directThread(threadId).markItemSeen(itemId);
+		} catch (error) {
+			this.logger.error('Failed to mark item as seen (API fallback)', error);
+			throw error;
 		}
 	}
 
@@ -1084,6 +1117,97 @@ export class InstagramClient extends EventEmitter {
 				error,
 			);
 		}
+	}
+
+	/**
+	 * Fetches the activity/news inbox for notifications (follows, mentions, likes, etc).
+	 */
+	public async getNotifications(): Promise<{
+		stories: Array<{
+			type: string;
+			user: {username: string; profilePicUrl?: string};
+			text: string;
+			timestamp: Date;
+		}>;
+		count: number;
+	}> {
+		const newsFeed = this.ig.feed.news();
+		const items = await newsFeed.items();
+
+		const notifications = ((items as any[]) ?? [])
+			.filter(item => item.type !== undefined)
+			.map(item => {
+				const user = item.args?.profile ?? {};
+				return {
+					type: item.type ?? 'unknown',
+					user: {
+						username: user.username ?? 'unknown',
+						profilePicUrl: user.profile_pic_url ?? undefined,
+					},
+					text: item.args?.text ?? item.args?.description ?? '',
+					timestamp: item.timestamp
+						? new Date(item.timestamp * 1000)
+						: new Date(),
+				};
+			})
+			.slice(0, 50);
+
+		return {
+			stories: notifications,
+			count: notifications.length,
+		};
+	}
+
+	/**
+	 * Polls for new followers by comparing current followers list with a cached snapshot.
+	 * Returns usernames of new followers since last check.
+	 */
+	public async getNewFollowers(
+		lastKnownFollowerIds: Set<string> = new Set<string>(),
+	): Promise<{newFollowers: string[]; allFollowerIds: Set<string>}> {
+		const followersFeed = this.ig.feed.accountFollowers(
+			this.ig.state.cookieUserId,
+		);
+		const followers = await followersFeed.items();
+
+		const allFollowerIds = new Set<string>();
+		const newFollowers: string[] = [];
+
+		for (const follower of followers) {
+			const id = follower.pk.toString();
+			allFollowerIds.add(id);
+			if (!lastKnownFollowerIds.has(id)) {
+				newFollowers.push(follower.username ?? 'unknown');
+			}
+		}
+
+		return {newFollowers, allFollowerIds};
+	}
+
+	/**
+	 * Fetches posts where the current user is tagged/mentioned.
+	 */
+	public async getMentions(limit = 20): Promise<
+		Array<{
+			user: {username: string; profilePicUrl?: string};
+			caption?: string;
+			mediaUrl?: string;
+			timestamp: Date;
+		}>
+	> {
+		const userId = this.ig.state.cookieUserId;
+		const usertagsFeed = this.ig.feed.usertags(userId);
+		const items = await usertagsFeed.items();
+
+		return ((items as any[]) ?? []).slice(0, limit).map(item => ({
+			user: {
+				username: item.user?.username ?? 'unknown',
+				profilePicUrl: item.user?.profile_pic_url ?? undefined,
+			},
+			caption: item.caption?.text ?? undefined,
+			mediaUrl: item.image_versions2?.candidates?.[0]?.url ?? undefined,
+			timestamp: item.taken_at ? new Date(item.taken_at * 1000) : new Date(),
+		}));
 	}
 
 	private setRealtimeStatus(status: RealtimeStatus) {

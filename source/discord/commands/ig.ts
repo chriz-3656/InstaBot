@@ -2,6 +2,9 @@ import {
 	ActionRowBuilder,
 	ButtonBuilder,
 	ButtonStyle,
+	EmbedBuilder,
+	StringSelectMenuBuilder,
+	StringSelectMenuOptionBuilder,
 	ModalBuilder,
 	SlashCommandBuilder,
 	TextInputBuilder,
@@ -9,16 +12,20 @@ import {
 	type ButtonInteraction,
 	type ChatInputCommandInteraction,
 	type ModalSubmitInteraction,
+	type StringSelectMenuInteraction,
 } from 'discord.js';
 import {type DmRelay} from '../../bridge/dm-relay.js';
+import {type NotificationPoller} from '../../bridge/notification-poller.js';
 import {
 	resolveThread,
 	type InstagramClient,
+	type SearchResult,
 } from '../../core/instagram/index.js';
 import {type AsyncQueue} from '../../safety/queue.js';
 import {type RateLimiter} from '../../safety/rate-limiter.js';
 import {withRetry} from '../../safety/retry.js';
 import {type DiscordAccountManager} from '../account-manager.js';
+import {buildReplyModal, buildSendModal} from '../modals.js';
 
 type InboxThread = Awaited<
 	ReturnType<InstagramClient['getThreads']>
@@ -27,6 +34,7 @@ type InboxThread = Awaited<
 export type IgCommandContext = {
 	accountManager: DiscordAccountManager;
 	dmRelay: DmRelay;
+	notificationPoller: NotificationPoller;
 	rateLimiter: RateLimiter;
 	queue: AsyncQueue;
 	ensureRelayAttached: (
@@ -35,17 +43,13 @@ export type IgCommandContext = {
 	) => Promise<void>;
 };
 
-const RISK_WARNING =
-	'Warning: Unofficial Instagram integration. Use temporary/demo accounts. Use at your own risk.';
+const EMBED_COLOR = 0x58_65_f2; // Discord blurple
+const SUCCESS_COLOR = 0x57_f2_87; // Discord green
+const ERROR_COLOR = 0xed_42_45; // Discord red
 
-const formatInboxLine = (thread: InboxThread): string => {
-	const unreadTag = thread.unread ? ' [UNREAD]' : '';
-	const preview =
-		thread.lastMessage && 'text' in thread.lastMessage
-			? ` - ${thread.lastMessage.text}`
-			: '';
-	return `${thread.title}${unreadTag}${preview} (id: ${thread.id})`;
-};
+// Discord limits (used for safeTruncate in embed builders)
+const MAX_LABEL_LENGTH = 100;
+const MAX_DESCRIPTION_LENGTH = 100;
 
 const normalizeLimit = (value: string | undefined, fallback = 20): number => {
 	const parsed = Number(value);
@@ -58,14 +62,30 @@ const normalizeLimit = (value: string | undefined, fallback = 20): number => {
 
 const parseInteractiveId = (
 	customId: string,
-	expectedKind: 'btn' | 'modal',
+	expectedKind: string,
 ): string | undefined => {
 	const parts = customId.split(':');
-	if (parts.length !== 3 || parts[0] !== 'ig' || parts[1] !== expectedKind) {
+	if (parts.length < 3 || parts[0] !== 'ig' || parts[1] !== expectedKind) {
 		return undefined;
 	}
 
 	return parts[2];
+};
+
+/**
+ * Safely truncate a string to maxBytes, handling multi-byte UTF characters.
+ */
+const safeTruncate = (text: string, maxBytes: number): string => {
+	const encoder = new TextEncoder();
+	const bytes = encoder.encode(text);
+	if (bytes.length <= maxBytes) return text;
+
+	// Truncate and decode back (handles multi-byte safely)
+	const decoder = new TextDecoder();
+	let truncated = decoder.decode(bytes.slice(0, maxBytes));
+	// Remove incomplete trailing characters
+	truncated = truncated.replace(/\uFFFD$/, '');
+	return truncated;
 };
 
 const resolveClient = async (
@@ -76,45 +96,324 @@ const resolveClient = async (
 	return {account, client};
 };
 
-const executeInbox = async (
-	client: InstagramClient,
-	limit = 20,
-): Promise<string> => {
-	const {threads} = await client.getThreads();
-	const lines = threads.slice(0, limit).map(thread => formatInboxLine(thread));
-	return lines.length > 0 ? lines.join('\n') : 'No threads found.';
-};
+// --- Embed builders ---
 
-const executeSearch = async (
-	client: InstagramClient,
-	query: string,
-	limit = 20,
-): Promise<string> => {
-	const [usernameResults, titleResults] = await Promise.all([
-		client.searchThreadByUsername(query).catch(() => []),
-		client.searchThreadsByTitle(query, {maxThreadsToSearch: limit * 4}),
-	]);
+const buildInboxEmbed = (
+	threads: InboxThread[],
+	limit: number,
+	account: string,
+): {
+	embeds: EmbedBuilder[];
+	components: Array<ActionRowBuilder<StringSelectMenuBuilder>>;
+} => {
+	if (threads.length === 0) {
+		return {
+			embeds: [
+				new EmbedBuilder()
+					.setColor(EMBED_COLOR)
+					.setTitle('Instagram Inbox')
+					.setDescription('No threads found.')
+					.setFooter({text: `Account: @${account}`}),
+			],
+			components: [],
+		};
+	}
 
-	const seen = new Set<string>();
-	const merged = [...usernameResults, ...titleResults].filter(result => {
-		if (seen.has(result.thread.id)) {
-			return false;
-		}
+	const fields = threads.slice(0, limit).map(thread => {
+		const lastMsg =
+			thread.lastMessage && 'text' in thread.lastMessage
+				? thread.lastMessage.text
+				: thread.lastMessage
+					? '[non-text message]'
+					: 'No messages yet';
 
-		seen.add(result.thread.id);
-		return true;
+		const timeAgo = getTimeAgo(thread.lastActivity);
+		const unreadIcon = thread.unread ? '\u{1F534} ' : ''; // red circle
+
+		return {
+			name: safeTruncate(`${unreadIcon}${thread.title}`, 256),
+			value: safeTruncate(
+				`${lastMsg.slice(0, 150)}${lastMsg.length > 150 ? '...' : ''}\n*${timeAgo}*`,
+				1024,
+			),
+			inline: false,
+		};
 	});
-	merged.sort((left, right) => right.score - left.score);
-	const lines = merged
-		.slice(0, limit)
-		.map(
-			result =>
-				`${result.thread.title} (${Math.round(result.score * 100)}%) [${result.thread.id}]`,
+
+	const embed = new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle('Instagram Inbox')
+		.setDescription(
+			`Showing ${Math.min(threads.length, limit)} of ${threads.length} threads`,
+		)
+		.setFields(fields.slice(0, 25)) // Discord max 25 fields
+		.setFooter({text: `Account: @${account} | ID: ${threads[0]?.id ?? 'N/A'}`})
+		.setTimestamp();
+
+	// Build select menu for thread navigation (max 25 options)
+	const selectOptions = threads.slice(0, 25).map(thread => {
+		const description =
+			thread.lastMessage && 'text' in thread.lastMessage
+				? `${thread.unread ? '[UNREAD] ' : ''}${(thread.lastMessage.text ?? '').slice(0, 80)}`
+				: thread.unread
+					? '[UNREAD] No messages'
+					: 'No messages';
+
+		return new StringSelectMenuOptionBuilder()
+			.setLabel(safeTruncate(thread.title, MAX_LABEL_LENGTH))
+			.setValue(`thread_${thread.id}`)
+			.setDescription(safeTruncate(description, MAX_DESCRIPTION_LENGTH))
+			.setEmoji(thread.unread ? '\u{1F534}' : '\u{26AA}');
+	});
+
+	const components: Array<ActionRowBuilder<StringSelectMenuBuilder>> = [];
+	if (selectOptions.length > 0) {
+		components.push(
+			new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+				new StringSelectMenuBuilder()
+					.setCustomId('ig:select:thread')
+					.setPlaceholder('Select a thread...')
+					.addOptions(selectOptions),
+			),
 		);
-	return lines.length > 0
-		? lines.join('\n')
-		: `No threads matching "${query}".`;
+	}
+
+	return {embeds: [embed], components};
 };
+
+const buildSearchEmbed = (
+	results: SearchResult[],
+	query: string,
+	limit: number,
+	account: string,
+): {
+	embeds: EmbedBuilder[];
+	components: Array<ActionRowBuilder<StringSelectMenuBuilder>>;
+} => {
+	if (results.length === 0) {
+		return {
+			embeds: [
+				new EmbedBuilder()
+					.setColor(EMBED_COLOR)
+					.setTitle('Search Results')
+					.setDescription(`No threads matching "${query}".`)
+					.setFooter({text: `Account: @${account}`}),
+			],
+			components: [],
+		};
+	}
+
+	const fields = results.slice(0, limit).map(result => {
+		const matchPercent = Math.round(result.score * 100);
+		const emoji =
+			matchPercent >= 80
+				? '\u{1F7E2}'
+				: matchPercent >= 50
+					? '\u{1F7E1}'
+					: '\u{1F534}';
+
+		const lastMsg =
+			result.thread.lastMessage && 'text' in result.thread.lastMessage
+				? result.thread.lastMessage.text
+				: 'No messages yet';
+
+		return {
+			name: safeTruncate(
+				`${emoji} ${result.thread.title} (${matchPercent}%)`,
+				256,
+			),
+			value: safeTruncate(
+				`${lastMsg.slice(0, 120)}${lastMsg.length > 120 ? '...' : ''}`,
+				1024,
+			),
+			inline: false,
+		};
+	});
+
+	const embed = new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle(`Search: "${safeTruncate(query, 256)}"`)
+		.setDescription(`Found ${results.length} matching threads`)
+		.setFields(fields.slice(0, 25))
+		.setFooter({text: `Account: @${account}`})
+		.setTimestamp();
+
+	// Build select menu
+	const selectOptions = results.slice(0, 25).map(result => {
+		const matchPercent = Math.round(result.score * 100);
+		return new StringSelectMenuOptionBuilder()
+			.setLabel(safeTruncate(result.thread.title, MAX_LABEL_LENGTH))
+			.setValue(`thread_${result.thread.id}`)
+			.setDescription(`${matchPercent}% match`)
+			.setEmoji(
+				matchPercent >= 80
+					? '\u{1F7E2}'
+					: matchPercent >= 50
+						? '\u{1F7E1}'
+						: '\u{1F534}',
+			);
+	});
+
+	const components: Array<ActionRowBuilder<StringSelectMenuBuilder>> = [];
+	if (selectOptions.length > 0) {
+		components.push(
+			new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+				new StringSelectMenuBuilder()
+					.setCustomId('ig:select:thread')
+					.setPlaceholder('Select a thread to send message...')
+					.addOptions(selectOptions),
+			),
+		);
+	}
+
+	return {embeds: [embed], components};
+};
+
+const buildSuccessEmbed = (
+	title: string,
+	description: string,
+	account?: string,
+): EmbedBuilder => {
+	const embed = new EmbedBuilder()
+		.setColor(SUCCESS_COLOR)
+		.setTitle(title)
+		.setDescription(description)
+		.setTimestamp();
+	if (account) {
+		embed.setFooter({text: `Account: @${account}`});
+	}
+
+	return embed;
+};
+
+const buildErrorEmbed = (
+	description: string,
+	account?: string,
+): EmbedBuilder => {
+	const embed = new EmbedBuilder()
+		.setColor(ERROR_COLOR)
+		.setTitle('Error')
+		.setDescription(description)
+		.setTimestamp();
+	if (account) {
+		embed.setFooter({text: `Account: @${account}`});
+	}
+
+	return embed;
+};
+
+const buildAccountListEmbed = (
+	accounts: string[],
+	current: string | undefined,
+): EmbedBuilder => {
+	const lines = accounts.map(account => {
+		const isActive = account === current;
+		return isActive
+			? `\u{2705} **${account}** _(active)_`
+			: `\u{2B1C} ${account}`;
+	});
+
+	return new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle('Instagram Accounts')
+		.setDescription(lines.join('\n') || 'No saved accounts found.')
+		.setFooter({text: `Use /ig account use <username> to switch`})
+		.setTimestamp();
+};
+
+const buildProfileEmbed = (
+	profile: {
+		username: string;
+		fullName: string;
+		biography: string;
+		followerCount: number;
+		followingCount: number;
+		mediaCount: number;
+		isPrivate: boolean;
+		isVerified: boolean;
+		externalUrl?: string;
+		profilePicUrl?: string;
+	},
+	account: string,
+): EmbedBuilder => {
+	const verificationBadge = profile.isVerified ? '\u{2705} ' : '';
+	const privacyStatus = profile.isPrivate
+		? '\u{1F512} Private'
+		: '\u{1F310} Public';
+
+	const embed = new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle(`${verificationBadge}@${profile.username}`)
+		.setDescription(
+			`**${profile.fullName}**\n\n${profile.biography || 'No bio'}\n\n` +
+				`\u{1F465} **Followers:** ${profile.followerCount.toLocaleString()}\n` +
+				`\u{1F464} **Following:** ${profile.followingCount.toLocaleString()}\n` +
+				`\u{1F4F7} **Posts:** ${profile.mediaCount.toLocaleString()}\n\n` +
+				`${privacyStatus}`,
+		)
+		.setFooter({text: `Queried by @${account}`})
+		.setTimestamp();
+
+	if (profile.profilePicUrl) {
+		embed.setThumbnail(profile.profilePicUrl);
+	}
+
+	if (profile.externalUrl) {
+		embed.setURL(profile.externalUrl);
+	}
+
+	return embed;
+};
+
+const buildUnreadEmbed = (
+	unreadThreads: Array<{
+		title: string;
+		unreadCount?: number;
+		lastMessage?: string | {text: string};
+		lastActivity: Date;
+		id: string;
+	}>,
+	totalThreads: number,
+	account: string,
+): EmbedBuilder => {
+	if (unreadThreads.length === 0) {
+		return new EmbedBuilder()
+			.setColor(SUCCESS_COLOR)
+			.setTitle('All Caught Up!')
+			.setDescription('\u{1F389} No unread messages.')
+			.setFooter({text: `Account: @${account}`})
+			.setTimestamp();
+	}
+
+	const fields = unreadThreads.map(thread => {
+		const lastMsg =
+			thread.lastMessage && typeof thread.lastMessage === 'object'
+				? thread.lastMessage.text
+				: (thread.lastMessage ?? 'No messages');
+
+		return {
+			name: safeTruncate(`\u{1F534} ${thread.title}`, 256),
+			value: safeTruncate(
+				`${lastMsg.slice(0, 100)}${lastMsg.length > 100 ? '...' : ''}\n*${getTimeAgo(thread.lastActivity)}*`,
+				1024,
+			),
+			inline: false,
+		};
+	});
+
+	return new EmbedBuilder()
+		.setColor(ERROR_COLOR)
+		.setTitle('Unread Messages')
+		.setDescription(
+			`You have **${unreadThreads.length}** unread thread(s) out of ${totalThreads} total.\n\n` +
+				'\u{1F534} = Unread',
+		)
+		.setFields(fields.slice(0, 25))
+		.setFooter({text: `Account: @${account}`})
+		.setTimestamp();
+};
+
+// --- Execute functions that return structured data ---
 
 const executeSend = async (
 	context: IgCommandContext,
@@ -123,8 +422,9 @@ const executeSend = async (
 	threadQuery: string,
 	text: string,
 	channelId: string,
-): Promise<string> => {
-	const {threadId} = await resolveThread(client, threadQuery);
+): Promise<{threadId: string; messageId: string; threadTitle?: string}> => {
+	const resolved = await resolveThread(client, threadQuery);
+	const {threadId} = resolved;
 	await context.dmRelay.mapThreadToChannel(account, threadId, channelId);
 
 	const queueKey = `send:${account}:${threadId}`;
@@ -134,7 +434,7 @@ const executeSend = async (
 		return withRetry(async () => client.sendMessage(threadId, text));
 	});
 
-	return `Sent message to thread ${threadId}. message_id=${messageId}`;
+	return {threadId, messageId};
 };
 
 const executeReply = async (
@@ -145,7 +445,7 @@ const executeReply = async (
 	replyToMessageId: string,
 	text: string,
 	channelId: string,
-): Promise<string> => {
+): Promise<{threadId: string; messageId: string; replyToUsername?: string}> => {
 	const {threadId} = await resolveThread(client, threadQuery);
 	await context.dmRelay.mapThreadToChannel(account, threadId, channelId);
 
@@ -183,37 +483,65 @@ const executeReply = async (
 		);
 	});
 
-	return `Reply sent in thread ${threadId}. message_id=${replyMessageId}`;
+	return {
+		threadId,
+		messageId: replyMessageId,
+		replyToUsername: replyToMessage.username,
+	};
 };
 
+// --- Panel rendering ---
+
 const renderPanel = (): {
-	content: string;
+	embeds: EmbedBuilder[];
 	components: Array<ActionRowBuilder<ButtonBuilder>>;
 } => {
 	const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
 		new ButtonBuilder()
 			.setCustomId('ig:btn:inbox')
 			.setLabel('Inbox')
-			.setStyle(ButtonStyle.Primary),
+			.setStyle(ButtonStyle.Primary)
+			.setEmoji('\u{1F4E5}'),
 		new ButtonBuilder()
 			.setCustomId('ig:btn:search')
 			.setLabel('Search')
-			.setStyle(ButtonStyle.Secondary),
+			.setStyle(ButtonStyle.Secondary)
+			.setEmoji('\u{1F50D}'),
 		new ButtonBuilder()
 			.setCustomId('ig:btn:send')
 			.setLabel('Send')
-			.setStyle(ButtonStyle.Success),
+			.setStyle(ButtonStyle.Success)
+			.setEmoji('\u{2709}\u{FE0F}'),
 		new ButtonBuilder()
 			.setCustomId('ig:btn:reply')
 			.setLabel('Reply')
-			.setStyle(ButtonStyle.Secondary),
+			.setStyle(ButtonStyle.Secondary)
+			.setEmoji('\u{21A9}\u{FE0F}'),
 	);
 
+	const embed = new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle('Instagram DM Manager')
+		.setDescription(
+			'Manage your Instagram direct messages from Discord.\n\n' +
+				'\u{1F4E5} **Inbox** - View recent DM threads\n' +
+				'\u{1F50D} **Search** - Find threads by username or title\n' +
+				'\u{2709}\u{FE0F} **Send** - Send a message to a thread\n' +
+				'\u{21A9}\u{FE0F} **Reply** - Reply to a specific message\n\n' +
+				'Use the buttons below to get started.',
+		)
+		.setFooter({
+			text: 'Unofficial Instagram integration - use at your own risk',
+		})
+		.setTimestamp();
+
 	return {
-		content: `${RISK_WARNING}\n\nInstagram panel`,
+		embeds: [embed],
 		components: [row],
 	};
 };
+
+// --- Modals ---
 
 const buildSearchModal = (): ModalBuilder => {
 	const queryInput = new TextInputBuilder()
@@ -221,7 +549,8 @@ const buildSearchModal = (): ModalBuilder => {
 		.setLabel('Query (username or title)')
 		.setRequired(true)
 		.setStyle(TextInputStyle.Short)
-		.setMaxLength(100);
+		.setMaxLength(100)
+		.setPlaceholder('Enter username or thread title');
 	const limitInput = new TextInputBuilder()
 		.setCustomId('limit')
 		.setLabel('Limit (1-50, optional)')
@@ -238,55 +567,7 @@ const buildSearchModal = (): ModalBuilder => {
 		);
 };
 
-const buildSendModal = (): ModalBuilder => {
-	const threadInput = new TextInputBuilder()
-		.setCustomId('thread')
-		.setLabel('Thread ID / username / title')
-		.setRequired(true)
-		.setStyle(TextInputStyle.Short);
-	const textInput = new TextInputBuilder()
-		.setCustomId('text')
-		.setLabel('Message text')
-		.setRequired(true)
-		.setStyle(TextInputStyle.Paragraph)
-		.setMaxLength(1800);
-
-	return new ModalBuilder()
-		.setCustomId('ig:modal:send')
-		.setTitle('IG Send')
-		.addComponents(
-			new ActionRowBuilder<TextInputBuilder>().addComponents(threadInput),
-			new ActionRowBuilder<TextInputBuilder>().addComponents(textInput),
-		);
-};
-
-const buildReplyModal = (): ModalBuilder => {
-	const threadInput = new TextInputBuilder()
-		.setCustomId('thread')
-		.setLabel('Thread ID / username / title')
-		.setRequired(true)
-		.setStyle(TextInputStyle.Short);
-	const messageIdInput = new TextInputBuilder()
-		.setCustomId('message_id')
-		.setLabel('Reply-to message ID')
-		.setRequired(true)
-		.setStyle(TextInputStyle.Short);
-	const textInput = new TextInputBuilder()
-		.setCustomId('text')
-		.setLabel('Reply text')
-		.setRequired(true)
-		.setStyle(TextInputStyle.Paragraph)
-		.setMaxLength(1800);
-
-	return new ModalBuilder()
-		.setCustomId('ig:modal:reply')
-		.setTitle('IG Reply')
-		.addComponents(
-			new ActionRowBuilder<TextInputBuilder>().addComponents(threadInput),
-			new ActionRowBuilder<TextInputBuilder>().addComponents(messageIdInput),
-			new ActionRowBuilder<TextInputBuilder>().addComponents(textInput),
-		);
-};
+// --- Slash command definition ---
 
 export const igCommand = new SlashCommandBuilder()
 	.setName('ig')
@@ -388,7 +669,78 @@ export const igCommand = new SlashCommandBuilder()
 					.setDescription('Reply message text')
 					.setRequired(true),
 			),
+	)
+	.addSubcommand(subcommand =>
+		subcommand
+			.setName('profile')
+			.setDescription('View Instagram profile info')
+			.addStringOption(option =>
+				option
+					.setName('username')
+					.setDescription('Instagram username to lookup')
+					.setRequired(true),
+			),
+	)
+	.addSubcommand(subcommand =>
+		subcommand
+			.setName('unsend')
+			.setDescription('Delete/unsend a previously sent message')
+			.addStringOption(option =>
+				option
+					.setName('thread')
+					.setDescription('Thread ID, username, or thread title')
+					.setRequired(true),
+			)
+			.addStringOption(option =>
+				option
+					.setName('message_id')
+					.setDescription('Message ID to delete')
+					.setRequired(true),
+			),
+	)
+	.addSubcommand(subcommand =>
+		subcommand
+			.setName('unread')
+			.setDescription('Check for unread messages and new chats')
+			.addIntegerOption(option =>
+				option
+					.setName('limit')
+					.setDescription('Maximum threads to show')
+					.setMinValue(1)
+					.setMaxValue(50),
+			),
+	)
+	.addSubcommand(subcommand =>
+		subcommand
+			.setName('notifications')
+			.setDescription('Toggle notification settings')
+			.addStringOption(option =>
+				option
+					.setName('type')
+					.setDescription('Notification type to toggle')
+					.setRequired(true)
+					.addChoices(
+						{name: 'Followers', value: 'followers'},
+						{name: 'Mentions', value: 'mentions'},
+					),
+			),
 	);
+
+// --- Time formatting helper ---
+
+function getTimeAgo(date: Date): string {
+	const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+	if (seconds < 60) return 'Just now';
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h ago`;
+	const days = Math.floor(hours / 24);
+	if (days < 7) return `${days}d ago`;
+	return date.toLocaleDateString();
+}
+
+// --- Command handlers ---
 
 export async function handleIgCommand(
 	interaction: ChatInputCommandInteraction,
@@ -405,16 +757,17 @@ export async function handleIgCommand(
 			const current = await context.accountManager.getCurrentAccount();
 			if (accounts.length === 0) {
 				await interaction.editReply({
-					content: `${RISK_WARNING}\n\nNo saved accounts found. Run \`npm run auth:login\` first.`,
+					embeds: [
+						buildErrorEmbed(
+							'No saved accounts found. Run `npm run auth:login` first.',
+						),
+					],
 				});
 				return;
 			}
 
-			const lines = accounts.map(account =>
-				account === current ? `• ${account} (current)` : `• ${account}`,
-			);
 			await interaction.editReply({
-				content: `${RISK_WARNING}\n\nSaved accounts:\n${lines.join('\n')}`,
+				embeds: [buildAccountListEmbed(accounts, current)],
 			});
 			return;
 		}
@@ -422,9 +775,17 @@ export async function handleIgCommand(
 		if (subcommand === 'current') {
 			const current = await context.accountManager.getCurrentAccount();
 			await interaction.editReply({
-				content: current
-					? `${RISK_WARNING}\n\nCurrent account: ${current}`
-					: `${RISK_WARNING}\n\nNo current account set. Use \`/ig account use <username>\`.`,
+				embeds: [
+					current
+						? buildSuccessEmbed(
+								'Current Account',
+								`Active account: **${current}**`,
+								current,
+							)
+						: buildErrorEmbed(
+								'No current account set. Use `/ig account use <username>`.',
+							),
+				],
 			});
 			return;
 		}
@@ -433,7 +794,13 @@ export async function handleIgCommand(
 			const username = interaction.options.getString('username', true).trim();
 			await context.accountManager.useAccount(username);
 			await interaction.editReply({
-				content: `${RISK_WARNING}\n\nActive account switched to: ${username}`,
+				embeds: [
+					buildSuccessEmbed(
+						'Account Switched',
+						`Active account is now **@${username}**`,
+						username,
+					),
+				],
 			});
 		}
 
@@ -449,27 +816,46 @@ export async function handleIgCommand(
 
 	if (subcommand === 'inbox') {
 		const limit = interaction.options.getInteger('limit') ?? 20;
-		const payload = await executeInbox(client, limit);
-		await interaction.editReply({
-			content: `${RISK_WARNING}\n\n${payload}`.slice(0, 1900),
-		});
+		const {threads} = await client.getThreads();
+		const {embeds, components} = buildInboxEmbed(threads, limit, account);
+		await interaction.editReply({embeds, components});
 		return;
 	}
 
 	if (subcommand === 'search') {
 		const query = interaction.options.getString('query', true);
 		const limit = interaction.options.getInteger('limit') ?? 20;
-		const payload = await executeSearch(client, query, limit);
-		await interaction.editReply({
-			content: `${RISK_WARNING}\n\n${payload}`.slice(0, 1900),
+		const [usernameResults, titleResults] = await Promise.all([
+			client.searchThreadByUsername(query).catch(() => []),
+			client.searchThreadsByTitle(query, {maxThreadsToSearch: limit * 4}),
+		]);
+
+		const seen = new Set<string>();
+		const merged = [...usernameResults, ...titleResults].filter(result => {
+			if (seen.has(result.thread.id)) {
+				return false;
+			}
+
+			seen.add(result.thread.id);
+			return true;
 		});
+		merged.sort((left, right) => right.score - left.score);
+		const results = merged.slice(0, limit);
+
+		const {embeds, components} = buildSearchEmbed(
+			results,
+			query,
+			limit,
+			account,
+		);
+		await interaction.editReply({embeds, components});
 		return;
 	}
 
 	if (subcommand === 'send') {
 		const threadQuery = interaction.options.getString('thread', true);
 		const text = interaction.options.getString('text', true);
-		const payload = await executeSend(
+		const result = await executeSend(
 			context,
 			account,
 			client,
@@ -477,7 +863,15 @@ export async function handleIgCommand(
 			text,
 			interaction.channelId,
 		);
-		await interaction.editReply({content: `${RISK_WARNING}\n\n${payload}`});
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Message Sent',
+					`Your message has been delivered successfully.\n\n\u{1F4E9} **Thread ID:** \`${result.threadId}\`\n\u{1F4CE} **Message ID:** \`${result.messageId}\``,
+					account,
+				),
+			],
+		});
 		return;
 	}
 
@@ -485,7 +879,7 @@ export async function handleIgCommand(
 		const threadQuery = interaction.options.getString('thread', true);
 		const messageId = interaction.options.getString('message_id', true);
 		const text = interaction.options.getString('text', true);
-		const payload = await executeReply(
+		const result = await executeReply(
 			context,
 			account,
 			client,
@@ -494,7 +888,110 @@ export async function handleIgCommand(
 			text,
 			interaction.channelId,
 		);
-		await interaction.editReply({content: `${RISK_WARNING}\n\n${payload}`});
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Reply Sent',
+					`Your reply has been sent successfully.\n\n\u{1F4E9} **Thread ID:** \`${result.threadId}\`\n\u{1F4CE} **Message ID:** \`${result.messageId}\`\n\u{21A9}\u{FE0F} **Replying to:** ${result.replyToUsername ?? 'Unknown'}`,
+					account,
+				),
+			],
+		});
+		return;
+	}
+
+	if (subcommand === 'profile') {
+		const username = interaction.options.getString('username', true).trim();
+		const profile = await withRetry(async () =>
+			client.getUserProfile(username),
+		);
+
+		if (!profile) {
+			await interaction.editReply({
+				embeds: [buildErrorEmbed(`User @${username} not found.`)],
+			});
+			return;
+		}
+
+		await interaction.editReply({
+			embeds: [buildProfileEmbed(profile, account)],
+		});
+		return;
+	}
+
+	if (subcommand === 'unsend') {
+		const threadQuery = interaction.options.getString('thread', true);
+		const messageId = interaction.options.getString('message_id', true);
+		const {threadId} = await resolveThread(client, threadQuery);
+
+		await context.queue.enqueue(`unsend:${account}:${threadId}`, async () => {
+			await context.rateLimiter.take(`unsend:${account}`);
+			return withRetry(async () => client.unsendMessage(threadId, messageId));
+		});
+
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Message Deleted',
+					`Message \`${messageId}\` has been deleted from thread \`${threadId}\`.`,
+					account,
+				),
+			],
+		});
+		return;
+	}
+
+	if (subcommand === 'unread') {
+		const limit = interaction.options.getInteger('limit') ?? 20;
+		const {threads} = await client.getThreads();
+
+		const unreadThreads = threads
+			.filter(t => t.unread)
+			.slice(0, limit)
+			.map(t => {
+				const lastMsg =
+					t.lastMessage && 'text' in t.lastMessage
+						? t.lastMessage.text
+						: t.lastMessage
+							? '[non-text message]'
+							: 'No messages yet';
+				return {
+					title: t.title,
+					lastMessage: lastMsg,
+					lastActivity: t.lastActivity,
+					id: t.id,
+				};
+			});
+
+		await interaction.editReply({
+			embeds: [buildUnreadEmbed(unreadThreads, threads.length, account)],
+		});
+		return;
+	}
+
+	if (subcommand === 'notifications') {
+		const notifType = interaction.options.getString('type', true) as
+			| 'followers'
+			| 'mentions';
+
+		// Use the poller's toggle method (accessed via context)
+		const isEnabled = context.notificationPoller.toggleSetting(
+			account,
+			notifType,
+		);
+
+		const emoji = notifType === 'followers' ? '\u{1F465}' : '\u{1F4DB}';
+		const status = isEnabled ? 'enabled' : 'disabled';
+
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Notification Updated',
+					`${emoji} **${notifType}** notifications are now **${status}**.`,
+					account,
+				),
+			],
+		});
 	}
 }
 
@@ -507,16 +1004,17 @@ export async function handleIgButton(
 		return false;
 	}
 
+	// Defer immediately for any action that will do async work
 	if (action === 'inbox') {
 		await interaction.deferReply({ephemeral: true});
-		const {client} = await resolveClient(context);
-		const payload = await executeInbox(client, 20);
-		await interaction.editReply({
-			content: `${RISK_WARNING}\n\n${payload}`.slice(0, 1900),
-		});
+		const {account, client} = await resolveClient(context);
+		const {threads} = await client.getThreads();
+		const {embeds, components} = buildInboxEmbed(threads, 20, account);
+		await interaction.editReply({embeds, components});
 		return true;
 	}
 
+	// showModal is instant, no defer needed
 	if (action === 'search') {
 		await interaction.showModal(buildSearchModal());
 		return true;
@@ -529,6 +1027,35 @@ export async function handleIgButton(
 
 	if (action === 'reply') {
 		await interaction.showModal(buildReplyModal());
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * Handles StringSelectMenu interactions from inbox/search embeds.
+ * Opens a send modal pre-filled with the selected thread ID.
+ */
+export async function handleIgSelectMenu(
+	interaction: StringSelectMenuInteraction,
+	_context: IgCommandContext,
+): Promise<boolean> {
+	const action = parseInteractiveId(interaction.customId, 'select');
+	if (!action) {
+		return false;
+	}
+
+	if (action === 'thread') {
+		const selectedValue = interaction.values[0];
+		if (!selectedValue) return false;
+
+		// Extract thread ID from value format: "thread_{id}"
+		const threadId = selectedValue.replace('thread_', '');
+		if (!threadId) return false;
+
+		// Open a send modal pre-filled with the thread ID
+		await interaction.showModal(buildSendModal(threadId));
 		return true;
 	}
 
@@ -558,17 +1085,37 @@ export async function handleIgModal(
 			interaction.fields.getTextInputValue('limit').trim(),
 			20,
 		);
-		const payload = await executeSearch(client, query, limit);
-		await interaction.editReply({
-			content: `${RISK_WARNING}\n\n${payload}`.slice(0, 1900),
+		const [usernameResults, titleResults] = await Promise.all([
+			client.searchThreadByUsername(query).catch(() => []),
+			client.searchThreadsByTitle(query, {maxThreadsToSearch: limit * 4}),
+		]);
+
+		const seen = new Set<string>();
+		const merged = [...usernameResults, ...titleResults].filter(result => {
+			if (seen.has(result.thread.id)) {
+				return false;
+			}
+
+			seen.add(result.thread.id);
+			return true;
 		});
+		merged.sort((left, right) => right.score - left.score);
+		const results = merged.slice(0, limit);
+
+		const {embeds, components} = buildSearchEmbed(
+			results,
+			query,
+			limit,
+			account,
+		);
+		await interaction.editReply({embeds, components});
 		return true;
 	}
 
 	if (action === 'send') {
 		const threadQuery = interaction.fields.getTextInputValue('thread').trim();
 		const text = interaction.fields.getTextInputValue('text').trim();
-		const payload = await executeSend(
+		const result = await executeSend(
 			context,
 			account,
 			client,
@@ -576,7 +1123,15 @@ export async function handleIgModal(
 			text,
 			channelId,
 		);
-		await interaction.editReply({content: `${RISK_WARNING}\n\n${payload}`});
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Message Sent',
+					`Your message has been delivered successfully.\n\n\u{1F4E9} **Thread ID:** \`${result.threadId}\`\n\u{1F4CE} **Message ID:** \`${result.messageId}\``,
+					account,
+				),
+			],
+		});
 		return true;
 	}
 
@@ -584,7 +1139,7 @@ export async function handleIgModal(
 		const threadQuery = interaction.fields.getTextInputValue('thread').trim();
 		const messageId = interaction.fields.getTextInputValue('message_id').trim();
 		const text = interaction.fields.getTextInputValue('text').trim();
-		const payload = await executeReply(
+		const result = await executeReply(
 			context,
 			account,
 			client,
@@ -593,10 +1148,20 @@ export async function handleIgModal(
 			text,
 			channelId,
 		);
-		await interaction.editReply({content: `${RISK_WARNING}\n\n${payload}`});
+		await interaction.editReply({
+			embeds: [
+				buildSuccessEmbed(
+					'Reply Sent',
+					`Your reply has been sent successfully.\n\n\u{1F4E9} **Thread ID:** \`${result.threadId}\`\n\u{1F4CE} **Message ID:** \`${result.messageId}\`\n\u{21A9}\u{FE0F} **Replying to:** ${result.replyToUsername ?? 'Unknown'}`,
+					account,
+				),
+			],
+		});
 		return true;
 	}
 
-	await interaction.editReply({content: 'Unsupported modal action.'});
+	await interaction.editReply({
+		embeds: [buildErrorEmbed('Unsupported modal action.')],
+	});
 	return true;
 }

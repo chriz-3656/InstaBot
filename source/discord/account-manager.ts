@@ -69,7 +69,10 @@ export class DiscordAccountManager {
 			}
 
 			return available.sort();
-		} catch {
+		} catch (error) {
+			logger.warn(
+				`Failed to list available accounts: ${error instanceof Error ? error.message : String(error)}`,
+			);
 			return [];
 		}
 	}
@@ -126,6 +129,20 @@ export class DiscordAccountManager {
 		logger.info(`Instagram account connected: ${account}`);
 		this.clients.set(account, client);
 		return {account, client};
+	}
+
+	public async getClientFor(
+		account: string,
+	): Promise<InstagramClient | undefined> {
+		const cached = this.clients.get(account);
+		if (cached) return cached;
+
+		try {
+			const {client} = await this.getClient(account);
+			return client;
+		} catch {
+			return undefined;
+		}
 	}
 
 	public async shutdown(): Promise<void> {

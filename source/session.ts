@@ -12,7 +12,7 @@ export class SessionManager {
 
 	constructor(username?: string) {
 		this.configManager = ConfigManager.getInstance();
-		this.username = username ?? undefined;
+		this.username = username;
 
 		if (!this.username) {
 			this.username = this.getDefaultUsername();

@@ -60,7 +60,16 @@ class Logger {
 
 			// Log initialization
 			this.info('Logger initialized', 'Logger');
-		} catch {}
+		} catch (error) {
+			// Log to stderr as last resort if file logging fails
+			// eslint-disable-next-line no-console
+			console.error(
+				'[Logger] Failed to initialize file logging, using stderr fallback',
+				error,
+			);
+			// Still mark as initialized so the bot can function
+			this.isInitialized = true;
+		}
 	}
 
 	error(message: string, context?: string, error?: Error | unknown): void {
@@ -204,8 +213,13 @@ class Logger {
 		try {
 			const formatted = this.formatLogEntry(entry);
 			await fs.promises.appendFile(this.logFilePath, `${formatted}\n`, 'utf8');
-		} catch {
-			// Silently fail if we can't write to file
+		} catch (error) {
+			// Fallback to stderr if file write fails
+			// eslint-disable-next-line no-console
+			console.error(
+				`[Logger] Failed to write to file: ${entry.message}`,
+				error,
+			);
 		}
 	}
 

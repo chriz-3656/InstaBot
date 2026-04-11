@@ -14,7 +14,7 @@ export class RateLimiter {
 	}
 
 	public async take(key: string): Promise<void> {
-		const attemptTake = async (): Promise<void> => {
+		while (true) {
 			const now = Date.now();
 			const bucket = this.buckets.get(key) ?? {
 				tokens: this.maxTokens,
@@ -35,14 +35,10 @@ export class RateLimiter {
 			}
 
 			this.buckets.set(key, bucket);
+			// eslint-disable-next-line no-await-in-loop
 			await new Promise<void>(resolve => {
-				setTimeout(() => {
-					resolve();
-				}, 100);
+				setTimeout(resolve, this.refillIntervalMs / 10);
 			});
-			return attemptTake();
-		};
-
-		return attemptTake();
+		}
 	}
 }

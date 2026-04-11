@@ -1,4 +1,7 @@
+import {createContextualLogger} from '../../utils/logger.js';
 import {type InstagramClient} from './client.js';
+
+const logger = createContextualLogger('ThreadResolver');
 
 /**
  * Resolves a thread identifier to a concrete thread ID.
@@ -28,7 +31,11 @@ export async function resolveThread(
 
 			return {threadId, userPk};
 		}
-	} catch {}
+	} catch (error) {
+		logger.warn(
+			`Failed to resolve thread by username, falling back to title search: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 
 	const titleResults = await client.searchThreadsByTitle(query);
 	if (titleResults.length > 0 && titleResults[0]) {
