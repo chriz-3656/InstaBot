@@ -9,13 +9,10 @@ import {
 	SlashCommandBuilder,
 	TextInputBuilder,
 	TextInputStyle,
-	ContainerBuilder,
-	TextDisplayBuilder,
 	type ButtonInteraction,
 	type ChatInputCommandInteraction,
 	type ModalSubmitInteraction,
 	type StringSelectMenuInteraction,
-	type APIMessageComponent,
 } from 'discord.js';
 import {type DmRelay} from '../../bridge/dm-relay.js';
 import {type NotificationPoller} from '../../bridge/notification-poller.js';
@@ -76,19 +73,123 @@ const parseInteractiveId = (
 };
 
 /**
- * Safely truncate a string to maxBytes, handling multi-byte UTF characters.
+ * Safely truncate a string to maxChars characters.
  */
-const safeTruncate = (text: string, maxBytes: number): string => {
+const safeTruncate = (text: string, maxChars: number): string => {
+	if (!text || text.length === 0) {
+		return '[No title]';
+	}
+
+	if (text.length <= maxChars) {
+		return text;
+	}
+
+	const truncated = text.slice(0, maxChars);
+	return truncated || '[No title]';
+};
+
+/**
+ * Truncate text to max bytes (for Discord descriptions, values, etc).
+ */
+const safeTruncateBytes = (text: string, maxBytes: number): string => {
 	const encoder = new TextEncoder();
 	const bytes = encoder.encode(text);
 	if (bytes.length <= maxBytes) return text;
 
-	// Truncate and decode back (handles multi-byte safely)
 	const decoder = new TextDecoder();
 	let truncated = decoder.decode(bytes.slice(0, maxBytes));
-	// Remove incomplete trailing characters
 	truncated = truncated.replace(/\uFFFD$/, '');
-	return truncated;
+	return truncated || '[truncated]';
+};
+
+/**
+ * Validate component structure before sending to Discord API.
+ * Checks customId lengths, label lengths, and component structure.
+ * Returns an array of validation errors (empty if valid).
+ */
+const validateComponents = (
+	components: Array<Record<string, unknown>>,
+): string[] => {
+	const errors: string[] = [];
+
+	for (let i = 0; i < components.length; i++) {
+		const component = components[i];
+		if (!component) continue;
+
+		// Check customId length
+		const customId = component['custom_id'] as string | undefined;
+		if (customId && customId.length > 100) {
+			errors.push(
+				`Component ${i}: customId too long (${customId.length} bytes, max 100)`,
+			);
+		}
+
+		// Check label length in buttons
+		const label = component['label'] as string | undefined;
+		if (label && label.length > 80) {
+			errors.push(
+				`Component ${i}: button label too long (${label.length} chars, max 80)`,
+			);
+		}
+
+		// Check select menu options
+		const options = component['options'] as
+			| Array<Record<string, unknown>>
+			| undefined;
+		if (options) {
+			for (let j = 0; j < options.length; j++) {
+				const option = options[j];
+				if (!option) continue;
+				const optionLabel = option['label'] as string | undefined;
+				if (optionLabel && optionLabel.length > 100) {
+					errors.push(
+						`Select option ${j}: label too long (${optionLabel.length} chars, max 100)`,
+					);
+				}
+				if (!optionLabel || optionLabel.length === 0) {
+					errors.push(`Select option ${j}: empty label`);
+				}
+				const optionValue = option['value'] as string | undefined;
+				if (!optionValue) {
+					errors.push(`Select option ${j}: missing value`);
+				}
+			}
+		}
+
+		// Check text_input components in modals
+		const textInputs = component['components'] as
+			| Array<Record<string, unknown>>
+			| undefined;
+		if (textInputs) {
+			for (let j = 0; j < textInputs.length; j++) {
+				const input = textInputs[j];
+				if (!input) continue;
+				const inputLabel = input['label'] as string | undefined;
+				if (inputLabel && inputLabel.length > 45) {
+					errors.push(
+						`TextInput ${j}: label too long (${inputLabel.length} chars, max 45)`,
+					);
+				}
+				const inputCustomId = input['custom_id'] as string | undefined;
+				if (inputCustomId && inputCustomId.length > 100) {
+					errors.push(
+						`TextInput ${j}: customId too long (${inputCustomId.length} bytes, max 100)`,
+					);
+				}
+			}
+		}
+
+		// Check nested components (action rows)
+		const actionRowComponents = component['components'] as
+			| Array<Record<string, unknown>>
+			| undefined;
+		if (actionRowComponents) {
+			const nestedErrors = validateComponents(actionRowComponents);
+			errors.push(...nestedErrors.map(err => `Component ${i}: ${err}`));
+		}
+	}
+
+	return errors;
 };
 
 const resolveClient = async (
@@ -135,7 +236,7 @@ const buildInboxEmbed = (
 
 		return {
 			name: safeTruncate(`${unreadIcon}${thread.title}`, 256),
-			value: safeTruncate(
+			value: safeTruncateBytes(
 				`${lastMsg.slice(0, 150)}${lastMsg.length > 150 ? '...' : ''}\n*${timeAgo}*`,
 				1024,
 			),
@@ -176,6 +277,8 @@ const buildInboxEmbed = (
 				new StringSelectMenuBuilder()
 					.setCustomId('ig:select:thread')
 					.setPlaceholder('Select a thread...')
+					.setMinValues(1)
+					.setMaxValues(1)
 					.addOptions(selectOptions),
 			),
 		);
@@ -225,7 +328,7 @@ const buildSearchEmbed = (
 				`${emoji} ${result.thread.title} (${matchPercent}%)`,
 				256,
 			),
-			value: safeTruncate(
+			value: safeTruncateBytes(
 				`${lastMsg.slice(0, 120)}${lastMsg.length > 120 ? '...' : ''}`,
 				1024,
 			),
@@ -264,6 +367,8 @@ const buildSearchEmbed = (
 				new StringSelectMenuBuilder()
 					.setCustomId('ig:select:thread')
 					.setPlaceholder('Select a thread to send message...')
+					.setMinValues(1)
+					.setMaxValues(1)
 					.addOptions(selectOptions),
 			),
 		);
@@ -496,8 +601,8 @@ const executeReply = async (
 // --- Panel rendering ---
 
 const renderPanel = (): {
-	content?: string;
-	components: APIMessageComponent[];
+	embeds: EmbedBuilder[];
+	components: Array<ActionRowBuilder<ButtonBuilder>>;
 } => {
 	// Messaging buttons row
 	const messagingRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -556,47 +661,25 @@ const renderPanel = (): {
 			.setEmoji('\u{1F4DB}'),
 	);
 
-	// Container with V2 components
-	const container = new ContainerBuilder()
-		.addTextDisplayComponents(
-			new TextDisplayBuilder().setContent(
-				'# \u{1F4F1} Instagram DM Manager\n' +
-					'Manage your Instagram direct messages from Discord.',
-			),
-		)
-		.addSeparatorComponents()
-		.addTextDisplayComponents(
-			new TextDisplayBuilder().setContent(
+	// Create embed with panel description
+	const embed = new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle('\u{1F4F1} Instagram DM Manager')
+		.setDescription(
+			'Manage your Instagram direct messages from Discord.\n\n' +
 				'## \u{2709}\u{FE0F} Messaging\n' +
-					'**Send** - Message a thread | **Reply** - Reply to a message | **Unsend** - Delete a message',
-			),
-		)
-		.addActionRowComponents(messagingRow)
-		.addSeparatorComponents()
-		.addTextDisplayComponents(
-			new TextDisplayBuilder().setContent(
+				'**Send** - Message a thread | **Reply** - Reply to a message | **Unsend** - Delete a message\n\n' +
 				'## \u{1F4E5} Inbox\n' +
-					'**Inbox** - View threads | **Search** - Find threads | **Unread** - Check unread chats',
-			),
-		)
-		.addActionRowComponents(inboxRow)
-		.addSeparatorComponents()
-		.addTextDisplayComponents(
-			new TextDisplayBuilder().setContent(
+				'**Inbox** - View threads | **Search** - Find threads | **Unread** - Check unread chats\n\n' +
 				'## \u{1F6E0}\u{FE0F} Tools & Notifications\n' +
-					'**Profile** - Lookup user | **Followers** - Toggle alerts | **Mentions** - Toggle alerts',
-			),
-		)
-		.addActionRowComponents(toolsRow)
-		.addSeparatorComponents()
-		.addTextDisplayComponents(
-			new TextDisplayBuilder().setContent(
+				'**Profile** - Lookup user | **Followers** - Toggle alerts | **Mentions** - Toggle alerts\n\n' +
 				'> \u{26A0}\u{FE0F} Unofficial Instagram integration — use at your own risk',
-			),
-		);
+		)
+		.setTimestamp();
 
 	return {
-		components: [container.toJSON()],
+		embeds: [embed],
+		components: [messagingRow, inboxRow, toolsRow],
 	};
 };
 
@@ -910,7 +993,7 @@ export async function handleIgCommand(
 	if (subcommand === 'panel') {
 		const panel = renderPanel();
 		await interaction.editReply({
-			content: panel.content,
+			embeds: panel.embeds,
 			components: panel.components,
 		});
 		return;

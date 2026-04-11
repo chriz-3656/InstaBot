@@ -26,6 +26,63 @@ export const slashCommands = [igCommand];
 
 const ERROR_COLOR = 0xed_42_45; // Discord red
 
+/**
+ * Global error handler for Discord API errors.
+ * Catches REST errors and returns user-friendly error embeds.
+ */
+export function handleDiscordApiError(
+	error: unknown,
+	context: string,
+): EmbedBuilder {
+	const errorCode = (error as {code?: number})?.code;
+	const errorMessage = (error as {message?: string})?.message ?? '';
+
+	logger.error(`Discord API error in ${context}`, error);
+
+	// Rate limited
+	if (errorCode === 429 || errorMessage.includes('rate limited')) {
+		return new EmbedBuilder()
+			.setColor(0xfa_a6_1a) // Discord yellow
+			.setTitle('Rate Limited')
+			.setDescription('Too many requests. Please wait a moment and try again.')
+			.setTimestamp();
+	}
+
+	// Missing permissions
+	if (errorCode === 50_013 || errorMessage.includes('Missing Permissions')) {
+		return new EmbedBuilder()
+			.setColor(ERROR_COLOR)
+			.setTitle('Permission Error')
+			.setDescription(
+				'I do not have permission to perform this action. ' +
+					'Please check my roles and channel permissions.',
+			)
+			.setTimestamp();
+	}
+
+	// Unknown channel/guild
+	if (
+		errorCode === 10_003 ||
+		errorCode === 10_007 ||
+		errorMessage.includes('Unknown')
+	) {
+		return new EmbedBuilder()
+			.setColor(ERROR_COLOR)
+			.setTitle('Not Found')
+			.setDescription('The target channel or server could not be found.')
+			.setTimestamp();
+	}
+
+	// Generic error
+	return new EmbedBuilder()
+		.setColor(ERROR_COLOR)
+		.setTitle('Discord API Error')
+		.setDescription(
+			`An error occurred while communicating with Discord: ${errorMessage.slice(0, 200) || 'Unknown error'}`,
+		)
+		.setTimestamp();
+}
+
 function buildErrorEmbed(message: string): {embeds: EmbedBuilder[]} {
 	return {
 		embeds: [
@@ -44,6 +101,7 @@ function buildErrorEmbed(message: string): {embeds: EmbedBuilder[]} {
  * - Already replied
  * - Not repliable
  * - Expired interaction
+ * - Discord API errors (rate limits, invalid form body, etc.)
  */
 async function safeReply(
 	interaction: Interaction,
@@ -66,12 +124,49 @@ async function safeReply(
 			await interaction.reply(options);
 		}
 	} catch (error) {
-		// Interaction may have expired, log but don't crash
-		if ((error as {code?: number})?.code === 10_062) {
+		const errorCode = (error as {code?: number})?.code;
+		const errorMessage = (error as {message?: string})?.message ?? '';
+
+		// Interaction expired (code 10062)
+		if (errorCode === 10_062) {
 			logger.warn('Interaction expired, skipping reply');
-		} else {
-			logger.error('Failed to reply to interaction', error);
+			return;
 		}
+
+		// Invalid Form Body (component validation errors)
+		if (errorCode === 50_035 || errorMessage.includes('Invalid Form Body')) {
+			logger.error('Discord API: Invalid Form Body', error);
+			// Attempt to send a simplified error message without components
+			try {
+				if (!interaction.replied) {
+					await interaction.editReply({
+						embeds: [
+							new EmbedBuilder()
+								.setColor(ERROR_COLOR)
+								.setTitle('UI Error')
+								.setDescription(
+									'Failed to render the interface. Please try again.',
+								)
+								.setTimestamp(),
+						],
+						components: [], // Remove components to avoid repeated errors
+					});
+				}
+			} catch {
+				// If even this fails, just log it
+				logger.error('Failed to send error message', error);
+			}
+			return;
+		}
+
+		// Rate limited (code 429)
+		if (errorCode === 429) {
+			logger.warn('Discord API: Rate limited, will retry later');
+			return;
+		}
+
+		// Unknown error
+		logger.error('Failed to reply to interaction', error);
 	}
 }
 

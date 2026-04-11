@@ -24,6 +24,30 @@ const MEDIA_COLOR = 0xe9_1e_63; // Pink
 const LINK_COLOR = 0x34_98_db; // Blue
 const SHARE_COLOR = 0xe6_7e_22; // Orange
 
+// Discord custom ID limit: 100 bytes
+const MAX_CUSTOM_ID_LENGTH = 100;
+
+/**
+ * Safely truncate a string to maxBytes, handling multi-byte UTF characters.
+ */
+const safeTruncate = (text: string, maxBytes: number): string => {
+	const encoder = new TextEncoder();
+	const bytes = encoder.encode(text);
+	if (bytes.length <= maxBytes) return text;
+
+	const decoder = new TextDecoder();
+	let truncated = decoder.decode(bytes.slice(0, maxBytes));
+	// Remove incomplete trailing characters
+	truncated = truncated.replace(/\uFFFD$/, '');
+	return truncated;
+};
+
+/**
+ * Safely truncate a customId to stay under Discord's 100-byte limit.
+ */
+const safeCustomId = (customId: string): string =>
+	safeTruncate(customId, MAX_CUSTOM_ID_LENGTH);
+
 function buildMessageEmbed(
 	message: Message,
 	account: string,
@@ -113,11 +137,13 @@ function buildMessageEmbed(
 	const components = [
 		new ActionRowBuilder<ButtonBuilder>().addComponents(
 			new ButtonBuilder()
-				.setCustomId(`ig:quick:reply:${message.threadId}:${message.id}`)
+				.setCustomId(
+					safeCustomId(`ig:quick:reply:${message.threadId}:${message.id}`),
+				)
 				.setLabel('Reply')
 				.setStyle(ButtonStyle.Primary),
 			new ButtonBuilder()
-				.setCustomId(`ig:quick:openthread:${message.threadId}`)
+				.setCustomId(safeCustomId(`ig:quick:openthread:${message.threadId}`))
 				.setLabel('Open Thread')
 				.setStyle(ButtonStyle.Secondary),
 		),

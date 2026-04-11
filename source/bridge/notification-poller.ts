@@ -1,7 +1,7 @@
 import {existsSync, readFileSync, writeFileSync, mkdirSync} from 'node:fs';
 import {join} from 'node:path';
 import process from 'node:process';
-import {type Client as DiscordClient, TextChannel} from 'discord.js';
+import {Client as DiscordClient, EmbedBuilder, TextChannel} from 'discord.js';
 import {type InstagramClient} from '../core/instagram/index.js';
 import {createContextualLogger} from '../utils/logger.js';
 
@@ -146,17 +146,14 @@ export class NotificationPoller {
 							newFollowers.length > 10
 								? ` and ${newFollowers.length - 10} more`
 								: '';
-						await channel.send({
-							embeds: [
-								{
-									title: '\u{1F514} New Followers',
-									description: `@${account} gained **${newFollowers.length}** new follower(s):\n\n${names}${more}`,
-									color: 0x57_f2_87,
-									timestamp: new Date().toISOString(),
-									footer: {text: `Account: @${account}`},
-								},
-							],
-						});
+						const description = `@${account} gained **${newFollowers.length}** new follower(s):\n\n${names}${more}`;
+						const embed = new EmbedBuilder()
+							.setTitle('\u{1F514} New Followers')
+							.setDescription(description.slice(0, 4095))
+							.setColor(0x57_f2_87)
+							.setTimestamp()
+							.setFooter({text: `Account: @${account}`});
+						await channel.send({embeds: [embed]});
 					}
 				}
 			}
@@ -188,26 +185,22 @@ export class NotificationPoller {
 				if (channelId) {
 					const channel = await discordClient.channels.fetch(channelId);
 					if (channel instanceof TextChannel) {
-						const sendPromises = newMentions.slice(0, 5).map(async mention =>
-							channel.send({
-								embeds: [
-									{
-										title: '\u{1F4DB} You were mentioned!',
-										description:
-											`**@${mention.user.username}** mentioned you\n\n` +
-											(mention.caption
-												? `"${mention.caption.slice(0, 200)}"`
-												: '[No caption]'),
-										color: 0x58_65_f2,
-										thumbnail: mention.mediaUrl
-											? {url: mention.mediaUrl}
-											: undefined,
-										timestamp: mention.timestamp.toISOString(),
-										footer: {text: `Account: @${account}`},
-									},
-								],
-							}),
-						);
+						const sendPromises = newMentions.slice(0, 5).map(async mention => {
+							const captionText = mention.caption
+								? `"${mention.caption.slice(0, 200)}"`
+								: '[No caption]';
+							const description = `**@${mention.user.username}** mentioned you\n\n${captionText}`;
+							const embed = new EmbedBuilder()
+								.setTitle('\u{1F4DB} You were mentioned!')
+								.setDescription(description)
+								.setColor(0x58_65_f2)
+								.setTimestamp(mention.timestamp)
+								.setFooter({text: `Account: @${account}`});
+							if (mention.mediaUrl) {
+								embed.setThumbnail(mention.mediaUrl);
+							}
+							return channel.send({embeds: [embed]});
+						});
 						await Promise.all(sendPromises);
 					}
 				}
